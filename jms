@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""
+jms — JumpServer → iTerm2 Launcher
+Log into JumpServer, browse assets, open iTerm2 SSH sessions.
+"""
+
+import json, os, subprocess, sys, ssl, urllib.request, urllib.error, argparse, http.cookiejar, getpass, hashlib, secrets
+from pathlib import Path
+from urllib.parse import urlparse
+
+CONFIG_DIR = Path.home() / ".jms-ghostty"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+TOKEN_FILE = CONFIG_DIR / "token.json"
+
+# JumpServer Client binary path
+JMS_CLIENT_BIN = "/Applications/JumpServerClient.app/Contents/Resources/darwin/client"
+
+ssl_ctx = ssl.create_default_context()
+ssl_ctx.check_hostname = False
+ssl_ctx.verify_mode = ssl.CERT_NONE
+
+
+_cookie_openers = {}  # cookie jar id → opener
+
+def api_request(url, method="GET", data=None, token=None, timeout=15, cookies=None):
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    body = json.dumps(data).encode() if data else None
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    if cookies is not None:
+        cj_id = id(cookies)
+        if cj_id not in _cookie_openers:
+            _cookie_openers[cj_id] = urllib.request.build_opener(
+                urllib.request.HTTPCookieProcessor(cookies)
+            )
+        opener = _cookie_openers[cj_id]
+    else:
+        opener = urllib.request.build_opener()
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read().decode())
+        except Exception:
+            return {"error": str(e.code)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def hash_password(password):
+    """Hash password with random salt for local verification."""
+    salt = secrets.token_hex(16)
+    h = hashlib.sha256((salt + password).encode()).hexdigest()
+    return f"{salt}${h}"
+
+def check_password(stored, password):
+    """Verify password against stored hash."""
+    try:
+        salt, h = stored.split("$")
+        return h == hashlib.sha256((salt + password).encode()).hexdigest()
+    except Exception:
+        return False
+
+def load_config():
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_config(config):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+def load_token():
+    if TOKEN_FILE.exists():
+        with open(TOKEN_FILE) as f:
+            return json.load(f).get("token")
+    return None
+
+
+def save_token(token):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(TOKEN_FILE, "w") as f:
+        json.dump({"token": token}, f)
+
+
+def login(base_url, config, password=None):
+    username = config.get("username") or input("Username: ").strip()
+    if password is None:
+        password = getpass.getpass("Password: ")
+    config.setdefault("username", username)
+    config.setdefault("base_url", base_url)
+    save_config(config)
+
+    url = f"{base_url}/api/v1/authentication/auth/"
+    print(f"Logging in to {base_url} as {username}...")
+
+    cookie_jar = http.cookiejar.CookieJar()
+
+    # Try password-only auth first (works if MFA session still active)
+    resp = api_request(url, method="POST",
+        data={"username": username, "password": password}, cookies=cookie_jar)
+    if "token" in resp:
+        save_token(resp["token"])
+        return resp["token"]
+
+    # MFA required — challenge then re-auth
+    msg = str(resp.get("msg") or resp.get("error") or "")
+    if "mfa" in msg.lower():
+        mfa_data = resp.get("data", {})
+        print(f"  MFA required")
+        code = input("MFA code: ").strip()
+        mfa_type = (mfa_data.get("choices") or ["otp"])[0]
+        mfa_url = mfa_data.get("url", "")
+        if mfa_url:
+            if mfa_url.startswith("/"):
+                mfa_url = base_url + mfa_url
+            api_request(mfa_url, method="POST",
+                data={"code": code, "type": mfa_type}, cookies=cookie_jar)
+        # Re-auth to get token
+        resp = api_request(url, method="POST",
+            data={"username": username, "password": password}, cookies=cookie_jar)
+        if "token" in resp:
+            save_token(resp["token"])
+            return resp["token"]
+
+    print(f"Login failed: {resp}")
+    sys.exit(1)
+
+def list_assets(base_url, token):
+    url = f"{base_url}/api/v1/assets/assets/"
+    resp = api_request(url, token=token)
+    if isinstance(resp, list):
+        return resp
+    elif isinstance(resp, dict):
+        return resp.get("results", [])
+    return []
+
+
+def get_koko_port(base_url, token):
+    """Get KoKo SSH port from JumpServer endpoint configuration."""
+    url = f"{base_url}/api/v1/terminal/endpoints/"
+    resp = api_request(url, token=token)
+    results = resp if isinstance(resp, list) else resp.get("results", [])
+    for ep in results:
+        port = ep.get("ssh_port", 0)
+        if port:
+            return port
+    return 2222
+
+
+def display_assets(assets, search=None):
+    if search:
+        assets = [a for a in assets if search.lower() in a.get("name", "").lower()]
+    if not assets:
+        print("No assets found.")
+        return None
+
+    print(f"\n{'#':<4} {'Name':<35} {'Address':<22} {'Protocols':<15}")
+    print("-" * 76)
+    for i, asset in enumerate(assets):
+        name = (asset.get("name") or "N/A")[:33]
+        addr = (asset.get("address") or "N/A")[:20]
+        protos = asset.get("protocols") or []
+        if isinstance(protos, list):
+            names = [p.get("name", str(p)) if isinstance(p, dict) else str(p) for p in protos]
+            protos = ", ".join(names)
+        elif isinstance(protos, str):
+            pass
+        else:
+            protos = "ssh"
+        print(f"{i+1:<4} {name:<35} {addr:<22} {str(protos):<15}")
+    return assets
+
+
+def interactive_pick(assets):
+    while True:
+        try:
+            choice = input(f"\nPick an asset [1-{len(assets)}] or 'q': ").strip()
+            if choice.lower() == 'q':
+                return None
+            idx = int(choice) - 1
+            if 0 <= idx < len(assets):
+                return assets[idx]
+        except (ValueError, IndexError):
+            pass
+        print("Invalid choice.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="JumpServer → iTerm2 Launcher")
+    parser.add_argument("--configure", action="store_true", help="Re-configure credentials")
+    parser.add_argument("--search", type=str, help="Filter assets by name")
+    parser.add_argument("--connect", type=str, help="Connect by asset ID")
+    parser.add_argument("--url", type=str, help="JumpServer URL")
+    args = parser.parse_args()
+
+    if args.configure:
+        base_url = input("JumpServer URL: ").strip().rstrip("/")
+        username = input("Username: ").strip()
+        password = getpass.getpass("Password: ")
+        config = {"base_url": base_url, "username": username,
+                  "password_hash": hash_password(password)}
+        save_config(config)
+        if TOKEN_FILE.exists():
+            TOKEN_FILE.unlink()
+        print("✓ Configured — password hash saved")
+        return
+
+    config = load_config()
+    config.pop("password", None)
+    base_url = args.url or config.get("base_url") or input("JumpServer URL: ").strip().rstrip("/")
+
+    # Local password gate
+    stored_hash = config.get("password_hash", "")
+    if not stored_hash:
+        print("No password configured. Run: jms-ghostty --configure")
+        sys.exit(1)
+    password = getpass.getpass("Password: ")
+    if not check_password(stored_hash, password):
+        print("Wrong password")
+        sys.exit(1)
+
+    # Auth — use cached token if valid, otherwise login
+    token = load_token()
+    if token:
+        test = api_request(f"{base_url}/api/v1/assets/assets/?limit=1", token=token)
+        if isinstance(test, dict) and "error" in test:
+            print("Token expired")
+            token = None
+    if not token:
+        token = login(base_url, config, password)
+
+    # Assets
+    print("Fetching assets...")
+    assets = list_assets(base_url, token)
+    if not assets:
+        print("No assets found.")
+        sys.exit(1)
+
+    # Pick asset
+    if args.connect:
+        selected = next((a for a in assets if str(a.get("id")) == args.connect), None)
+        if not selected:
+            print(f"Asset {args.connect} not found.")
+            sys.exit(1)
+    else:
+        display_assets(assets, search=args.search)
+        selected = interactive_pick(assets)
+        if not selected:
+            print("Cancelled.")
+            return
+
+    asset_id = selected["id"]
+    asset_name = selected.get("name", "N/A")
+    print(f"\nConnecting to: {asset_name}")
+
+    # Get account for this asset
+    accounts_url = f"{base_url}/api/v1/accounts/accounts/?asset={asset_id}"
+    accounts_resp = api_request(accounts_url, token=token)
+    accounts = accounts_resp if isinstance(accounts_resp, list) else accounts_resp.get("results", [])
+    account_id = accounts[0]["id"] if accounts else None
+    if not account_id:
+        print("No system account found for this asset.")
+        sys.exit(1)
+
+    # Get connection token
+    ct_url = f"{base_url}/api/v1/authentication/connection-token/"
+    ct_resp = api_request(ct_url, method="POST", data={
+        "asset": asset_id, "account": account_id, "connect_method": "ssh_client"
+    }, token=token)
+
+    if "error" in ct_resp:
+        print(f"Connection token error: {ct_resp}")
+        sys.exit(1)
+
+    token_id = ct_resp["id"]
+    token_value = ct_resp["value"]
+
+    # Get KoKo host and port
+    jms_host = urlparse(base_url).hostname or "192.168.105.96"
+    koko_port = get_koko_port(base_url, token)
+
+    # Build the SSH command (exactly like JumpServer Client)
+    ssh_username = f"JMS-{token_id}"
+    cmd_str = f"{JMS_CLIENT_BIN} ssh {ssh_username}@{jms_host} -p {str(koko_port)} -P {token_value}"
+    print(f"  {cmd_str}")
+
+    # Launch iTerm2 with tab support
+    subprocess.run([
+        "osascript",
+        "-e", 'tell application "iTerm2"',
+        "-e", 'if (count of windows) = 0 then',
+        "-e", f'  create window with default profile command "{cmd_str}"',
+        "-e", 'else',
+        "-e", '  tell current window',
+        "-e", f'    create tab with default profile command "{cmd_str}"',
+        "-e", '  end tell',
+        "-e", 'end if',
+        "-e", 'activate',
+        "-e", 'end tell',
+    ])
+    print(f"✓ Launched iTerm2 → {asset_name}")
+
+if __name__ == "__main__":
+    main()
