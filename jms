@@ -41,6 +41,9 @@ def api_request(url, method="GET", data=None, token=None, timeout=15, cookies=No
         with opener.open(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
+        # Auto-detect auth errors for token refresh
+        if e.code in (401, 403) and token:
+            return {"__auth_error__": True, "code": e.code}
         try:
             return json.loads(e.read().decode())
         except Exception:
@@ -236,9 +239,24 @@ def main():
     if not token:
         token = login(base_url, config, password)
 
-    # Assets
-    print("Fetching assets...")
-    assets = list_assets(base_url, token)
+    # Assets — with auto token refresh on auth error
+    def fetch_assets_with_retry(base_url, token, config, password, max_retries=1):
+        for attempt in range(max_retries + 1):
+            print("Fetching assets..." if attempt == 0 else "  Retrying with fresh token...")
+            assets = list_assets(base_url, token)
+            # Check for auth error marker
+            if isinstance(assets, dict) and assets.get("__auth_error__"):
+                if attempt < max_retries:
+                    print("  ⚠️  Token expired, refreshing...")
+                    if TOKEN_FILE.exists():
+                        TOKEN_FILE.unlink()
+                    token = login(base_url, config, password)
+                    continue
+            if assets is not None:
+                return assets
+        return []
+
+    assets = fetch_assets_with_retry(base_url, token, config, password)
     if not assets:
         print("No assets found.")
         sys.exit(1)
