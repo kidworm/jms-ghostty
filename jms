@@ -141,6 +141,8 @@ def list_assets(base_url, token):
     if isinstance(resp, list):
         return resp
     elif isinstance(resp, dict):
+        if "__auth_error__" in resp:
+            return resp
         return resp.get("results", [])
     return []
 
@@ -233,7 +235,7 @@ def main():
     token = load_token()
     if token:
         test = api_request(f"{base_url}/api/v1/assets/assets/?limit=1", token=token)
-        if isinstance(test, dict) and "error" in test:
+        if isinstance(test, dict) and ("error" in test or "__auth_error__" in test or "detail" in test):
             print("Token expired")
             token = None
     if not token:

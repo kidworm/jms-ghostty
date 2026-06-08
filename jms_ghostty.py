@@ -30,6 +30,9 @@ def api_request(url, method="GET", data=None, token=None, timeout=15):
         with urllib.request.urlopen(req, timeout=timeout, context=ssl_ctx) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
+        # Auto-detect auth errors for token refresh
+        if e.code in (401, 403) and token:
+            return {"__auth_error__": True, "code": e.code}
         try:
             return json.loads(e.read().decode())
         except Exception:
@@ -114,6 +117,8 @@ def list_assets(base_url, token):
     if isinstance(resp, list):
         return resp
     elif isinstance(resp, dict):
+        if "__auth_error__" in resp:
+            return resp
         return resp.get("results", [])
     return []
 
@@ -193,15 +198,29 @@ def main():
     token = load_token()
     if token:
         test = api_request(f"{base_url}/api/v1/assets/assets/?limit=1", token=token)
-        if isinstance(test, dict) and "error" in test:
+        if isinstance(test, dict) and ("error" in test or "__auth_error__" in test or "detail" in test):
             print("Token expired, re-authenticating...")
             token = None
     if not token:
         token = login(base_url, config)
 
-    # Assets
-    print("Fetching assets...")
-    assets = list_assets(base_url, token)
+    # Assets — with auto token refresh on auth error
+    def fetch_assets_with_retry(base_url, token, config, max_retries=1):
+        for attempt in range(max_retries + 1):
+            print("Fetching assets..." if attempt == 0 else "  Retrying with fresh token...")
+            assets = list_assets(base_url, token)
+            if isinstance(assets, dict) and assets.get("__auth_error__"):
+                if attempt < max_retries:
+                    print("  ⚠️  Token expired, refreshing...")
+                    if TOKEN_FILE.exists():
+                        TOKEN_FILE.unlink()
+                    token = login(base_url, config)
+                    continue
+            if assets is not None:
+                return assets
+        return []
+
+    assets = fetch_assets_with_retry(base_url, token, config)
     if not assets:
         print("No assets found.")
         sys.exit(1)
