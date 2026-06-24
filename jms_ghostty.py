@@ -12,8 +12,8 @@ CONFIG_DIR = Path.home() / ".jms-ghostty"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 TOKEN_FILE = CONFIG_DIR / "token.json"
 
-# JumpServer Client binary path
-JMS_CLIENT_BIN = "/Applications/JumpServerClient.app/Contents/Resources/darwin/client"
+# System OpenSSH binary path
+SSH_BIN = "/usr/bin/ssh"
 
 ssl_ctx = ssl.create_default_context()
 ssl_ctx.check_hostname = False
@@ -268,15 +268,25 @@ def main():
     jms_host = urlparse(base_url).hostname or "192.168.105.96"
     koko_port = get_koko_port(base_url, token)
 
-    # Build the SSH command (exactly like JumpServer Client)
+    # Build a pure OpenSSH command. The connection token value is the one-time
+    # password; OpenSSH intentionally does not accept passwords as CLI args.
     ssh_username = f"JMS-{token_id}"
     cmd_parts = [
-        JMS_CLIENT_BIN, "ssh",
-        f"{ssh_username}@{jms_host}",
+        SSH_BIN,
+        "-o", "PreferredAuthentications=password,keyboard-interactive",
+        "-o", "PasswordAuthentication=yes",
+        "-o", "KbdInteractiveAuthentication=yes",
+        "-o", "PubkeyAuthentication=no",
+        "-o", "NumberOfPasswordPrompts=1",
         "-p", str(koko_port),
-        "-P", token_value,
+        f"{ssh_username}@{jms_host}",
     ]
     cmd_str = " ".join(cmd_parts)
+    try:
+        subprocess.run(["pbcopy"], input=token_value, text=True, check=True)
+        print("  One-time SSH password copied to clipboard. Paste it at the SSH password prompt.")
+    except Exception:
+        print(f"  One-time SSH password: {token_value}")
     print(f"  {cmd_str}")
 
     # Launch Ghostty
